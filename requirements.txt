@@ -1,0 +1,41 @@
+# ---------------------------------------------------------------------------
+# LOFOP Sentinel - runtime dependencies
+#
+#   pip install -r requirements.txt          core console (simulation works)
+#
+# The core stack alone runs the full product in Simulation mode: tracking,
+# zones, events, analytics and the dashboard all work with no model weights.
+# Detection backends are optional and are reported honestly at startup.
+# ---------------------------------------------------------------------------
+
+# -- Core (required) --------------------------------------------------------
+PyQt6>=6.5
+opencv-python>=4.8
+numpy>=1.24
+
+# -- Strongly recommended ----------------------------------------------------
+# supervision: detection container, annotators, zone/line utilities.
+#              Without it the OpenCV renderer is used instead.
+supervision>=0.20
+# psutil: CPU / RAM telemetry for the Edge System panel.
+psutil>=5.9
+# scipy: optimal (Hungarian) track association; a greedy fallback is used
+#        automatically when it is absent.
+scipy>=1.10
+
+# -- Detection backends (optional; install what you need) --------------------
+# Neither backend is required to run the application.
+#
+#   RT-DETR (HuggingFace transformers):
+#       pip install torch transformers
+#   RF-DETR (Roboflow):
+#       pip install torch rfdetr
+#
+# For CPU-only PyTorch:
+#       pip install torch --index-url https://download.pytorch.org/whl/cpu
+#
+# NOTE: this project deliberately does NOT depend on Ultralytics / YOLO.
+#
+# torch>=2.0
+# transformers>=4.40
+# rfdetr>=1.0
