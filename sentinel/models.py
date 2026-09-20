@@ -24,6 +24,7 @@ from sentinel.theme import Palette
 __all__ = [
     "Severity", "EventType", "AppMode", "SourceKind", "BackendKind",
     "DevicePref", "ModelState", "PipelineState", "TrackPhase", "ZoneKind",
+    "NightMode", "NightStatus", "ThermalMode", "ThermalPalette",
     "PERSON_CLASS_NAMES", "VEHICLE_CLASS_NAMES",
     "Detection", "TrackedObject", "ZoneConfig", "LineConfig", "SecurityEvent",
     "Timings", "FramePacket", "ZoneStatus", "FrameResult", "AppSettings",
@@ -63,6 +64,7 @@ class EventType(Enum):
     OBJECT_LOST = "OBJECT_LOST"
     UNATTENDED_AREA = "UNATTENDED_AREA"
     PROXIMITY_WARNING = "PROXIMITY_WARNING"
+    LOW_LIGHT = "LOW_LIGHT"
     SYSTEM_WARNING = "SYSTEM_WARNING"
 
 
@@ -88,6 +90,42 @@ class DevicePref(Enum):
     AUTO = "Auto"
     CPU = "CPU"
     CUDA = "CUDA"
+
+
+class NightMode(Enum):
+    """Low-light enhancement policy.
+
+    AUTO engages enhancement only when the scene is actually dark, which keeps
+    the cost off the pipeline in daylight.
+    """
+
+    OFF = "Off"
+    AUTO = "Auto"
+    ON = "On"
+
+
+class ThermalMode(Enum):
+    """Thermal imaging policy.
+
+    PALETTE is a display filter usable with any camera.  RADIOMETRIC additionally
+    reports temperatures, and is only valid when the active source really is a
+    calibrated thermal camera - see :mod:`sentinel.vision.thermal`.
+    """
+
+    OFF = "Off"
+    PALETTE = "False Colour"
+    RADIOMETRIC = "Radiometric"
+
+
+class ThermalPalette(Enum):
+    """False-colour ramps."""
+
+    IRON = "Iron"
+    INFERNO = "Inferno"
+    RAINBOW = "Rainbow"
+    PLASMA = "Plasma"
+    WHITE_HOT = "White Hot"
+    BLACK_HOT = "Black Hot"
 
 
 class ModelState(Enum):
@@ -373,6 +411,7 @@ class Timings:
 
     capture_ms: float = 0.0
     preprocess_ms: float = 0.0
+    enhance_ms: float = 0.0
     detect_ms: float = 0.0
     track_ms: float = 0.0
     event_ms: float = 0.0
@@ -380,8 +419,9 @@ class Timings:
 
     @property
     def total_ms(self) -> float:
-        return (self.capture_ms + self.preprocess_ms + self.detect_ms
-                + self.track_ms + self.event_ms + self.annotate_ms)
+        return (self.capture_ms + self.preprocess_ms + self.enhance_ms
+                + self.detect_ms + self.track_ms + self.event_ms
+                + self.annotate_ms)
 
 
 @dataclass(slots=True)
@@ -414,6 +454,30 @@ class ZoneStatus:
 
 
 @dataclass(slots=True)
+class NightStatus:
+    """Outcome of the low-light analysis for one frame.
+
+    SCOPE: this is a low-light *enhancement* stage driven by scene luminance.
+    It is not a thermal or infrared sensor, and it cannot reveal anything the
+    camera did not capture - in total darkness there is no signal to enhance.
+    """
+
+    active: bool = False                # enhancement applied to this frame
+    mode: NightMode = NightMode.AUTO
+    luminance: float = 0.0              # mean scene luma, 0-255
+    saturation: float = 0.0             # mean saturation, 0-255
+    monochrome: bool = False            # near-zero saturation => IR illuminator
+    gain: float = 1.0                   # brightness gain applied
+    clip_limit: float = 0.0             # CLAHE clip limit applied
+
+    @property
+    def label(self) -> str:
+        if not self.active:
+            return "Day"
+        return "Night (IR)" if self.monochrome else "Night"
+
+
+@dataclass(slots=True)
 class FrameResult:
     """Everything the GUI needs to render one processed frame."""
 
@@ -434,6 +498,11 @@ class FrameResult:
     line_in: int = 0
     line_out: int = 0
     occupancy: int = 0
+    line_counts: Dict[str, Tuple[int, int]] = field(default_factory=dict)
+    night: "NightStatus" = field(default_factory=lambda: NightStatus())
+    # Thermal analysis for this frame.  Typed loosely to keep models.py free of
+    # a dependency on the vision layer; see sentinel.vision.thermal.
+    thermal: Any = None
 
 
 @dataclass
@@ -469,6 +538,24 @@ class AppSettings:
     person_classes_only: bool = False
     detect_on_simulation: bool = False   # run a real model over simulated frames
 
+    # -- low-light / night vision -------------------------------------------
+    night_mode: NightMode = NightMode.AUTO
+    night_threshold: int = 70        # mean luma below which AUTO engages (0-255)
+    night_strength: float = 0.6      # 0..1 enhancement aggressiveness
+    night_denoise: bool = True       # suppress the noise that gain amplifies
+    night_tint: bool = False         # green display tint (cosmetic, display only)
+    night_enhance_detection: bool = True   # feed the enhanced frame to the model
+
+    # -- thermal / false-colour imaging --------------------------------------
+    thermal_mode: ThermalMode = ThermalMode.OFF
+    thermal_palette: ThermalPalette = ThermalPalette.IRON
+    thermal_hotspot_threshold: int = 82   # intensity percentile for a hotspot
+    thermal_overlay: bool = True          # colour scale + hotspot boxes on frame
+    # Calibration, used ONLY in RADIOMETRIC mode: the temperature span the
+    # source's pixel range maps onto.  Taken from the camera, never guessed.
+    thermal_min_c: float = 20.0
+    thermal_max_c: float = 120.0
+
     def to_dict(self) -> Dict[str, Any]:
         data: Dict[str, Any] = {}
         for f in dataclasses.fields(self):
@@ -481,6 +568,8 @@ class AppSettings:
         out = cls()
         enum_map = {
             "mode": AppMode, "backend": BackendKind, "device": DevicePref,
+            "night_mode": NightMode,
+            "thermal_mode": ThermalMode, "thermal_palette": ThermalPalette,
         }
         for f in dataclasses.fields(cls):
             if f.name not in data:

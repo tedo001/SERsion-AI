@@ -51,8 +51,10 @@ sentinel/
 │   └── simulation.py        synthetic CCTV scene + ground-truth boxes
 ├── vision/                  per-frame pipeline stages
 │   ├── zones.py             scenario zone/line presets (normalised coords)
+│   ├── night_vision.py      low-light detection + CLAHE/gamma enhancement
+│   ├── thermal.py           false-colour palettes + hotspot analysis
 │   ├── supervision_adapter.py  optional supervision bridge
-│   ├── renderer.py          zones, boxes, IDs, HUD (OpenCV fallback built in)
+│   ├── renderer.py          zones, boxes, IDs, HUD, thermal overlay
 │   ├── events.py            event engine with severity grading + cooldowns
 │   └── analytics.py         rolling time series and counters
 ├── storage/                 SQLite event store, settings + zone persistence
@@ -64,7 +66,8 @@ sentinel/
 ├── ui/                      Qt presentation layer
 │   ├── widgets.py           StatCard, Sparkline, BarMeter, PipelineDiagram
 │   ├── video_view.py        aspect-correct surface with zoom/pan/zone editing
-│   ├── live_panel.py        right-hand live analytics dock
+│   ├── zone_editor.py       zone / counting-line editor dialogs
+│   ├── live_panel.py        right-hand dock; editable zone + line status rows
 │   ├── main_window.py       shell: chrome + wiring only
 │   └── pages/               one self-contained widget per page
 ├── startup.py               QApplication setup, theming, autostart
@@ -118,10 +121,60 @@ This project deliberately does **not** depend on Ultralytics / YOLO.
 CUDA is detected at runtime and the application falls back to CPU rather than
 failing.
 
+## Night vision (low-light enhancement)
+
+Measures scene luminance and, when the scene is genuinely dark, rebuilds local
+contrast so the detector has something to work with: CLAHE on the L channel,
+gamma lift, and an optional edge-preserving denoise (gain amplifies sensor
+noise, and noise produces phantom detections). `Auto` engages only below a
+configurable luma threshold, with hysteresis so a borderline scene does not
+flap. Costs ~6 ms/frame when engaged and nothing measurable when it is not.
+
+> **What it is not:** image enhancement, not a thermal or infrared sensor. It
+> can only amplify light the camera actually captured — in total darkness there
+> is nothing to amplify. It adds no detection capability of its own; a model
+> backend is still required. Crossing between day and low light raises a
+> `LOW_LIGHT` event (edge-triggered, one per transition).
+
+## Thermal imaging
+
+Two distinct modes, and the difference is deliberate:
+
+| Mode | Works with | Reports |
+|---|---|---|
+| **False Colour** | any camera | image **intensity** as a percentage |
+| **Radiometric** | a calibrated thermal camera only | **degrees Celsius** |
+
+False Colour maps pixel brightness through a thermal ramp (iron, inferno,
+rainbow, plasma, white-hot, black-hot) and finds bright-region "hotspots". It
+is a display filter — the on-frame banner says so, and every reading is a
+percentage.
+
+Radiometric maps pixel values linearly onto a temperature span **you supply
+from your camera's datasheet**, which is how the AGC-normalised greyscale
+streams from common USB thermal cameras (FLIR Lepton/PureThermal, Seek,
+Hikvision IR) are meant to be read.
+
+> **A visible-light camera cannot measure temperature.** In False Colour mode
+> every temperature field is `None` and the UI shows intensity percent, because
+> printing an invented °C figure in a safety tool is worse than showing none.
+
+Thermal is applied **after** detection: a palette-mapped frame is far outside a
+COCO-trained model's input distribution, so the detector keeps receiving the
+real (or night-enhanced) image.
+
+## Editing zones live
+
+Zone and counting-line rows in the right-hand Zone Status panel are editable in
+place — double-click a row, or select it and press **Edit Selected**. The zone
+editor covers name, type, severity, colour, occupancy limit and unattended
+timeout; the line editor covers name, colour, enabled state and both normalised
+endpoints. Changes apply to the running pipeline immediately and are persisted.
+
 ## Scope
 
 Geometric and count-based rules only: zone entry, line crossing, occupancy,
-crowding, unattended area, and worker-machine proximity.
+crowding, unattended area, worker-machine proximity, and low-light transitions.
 
 The application **cannot** infer PPE compliance, falls, weapons or fatigue.
 Those are listed in the Models page explicitly as *not implemented*, together

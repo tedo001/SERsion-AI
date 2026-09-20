@@ -7,8 +7,8 @@ import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from sentinel.models import (
-    AppSettings, EventType, LineConfig, SecurityEvent, Severity, TrackedObject,
-    ZoneConfig, ZoneKind, ZoneStatus,
+    AppSettings, EventType, LineConfig, NightStatus, SecurityEvent, Severity,
+    TrackedObject, ZoneConfig, ZoneKind, ZoneStatus,
 )
 
 __all__ = ["EventEngine"]
@@ -51,6 +51,7 @@ class EventEngine:
         EventType.PERSON_ENTERED: 0.0,
         EventType.PERSON_EXITED: 0.0,
         EventType.SYSTEM_WARNING: 10.0,
+        EventType.LOW_LIGHT: 0.0,      # edge-triggered, not rate limited
     }
 
     def __init__(self, settings: AppSettings) -> None:
@@ -65,6 +66,7 @@ class EventEngine:
         self._line_counts: Dict[str, List[int]] = {}    # line_id -> [in, out]
         self._zone_empty_since: Dict[str, float] = {}
         self._known_vehicles: set = set()
+        self._night_active: Optional[bool] = None
         self._lock = threading.RLock()
 
     # -- configuration --------------------------------------------------------
@@ -94,6 +96,7 @@ class EventEngine:
             self._line_counts = {line.line_id: [0, 0] for line in self._lines}
             self._zone_empty_since.clear()
             self._known_vehicles.clear()
+            self._night_active = None
 
     @property
     def line_counts(self) -> Dict[str, Tuple[int, int]]:
@@ -336,6 +339,34 @@ class EventEngine:
                         f"of '{zone.name}'",
                         track_id=person.track_id, zone=zone.name,
                     ))
+
+    def note_light_conditions(self, night: NightStatus) -> List[SecurityEvent]:
+        """Emit an event when the scene crosses between day and low light.
+
+        Edge-triggered: one event per transition, not one per frame.  Severity
+        is INFO because low light is a scene condition, not a safety incident -
+        though it does mean detection confidence should be read with care.
+        """
+        with self._lock:
+            if self._night_active == night.active:
+                return []
+            first_observation = self._night_active is None
+            self._night_active = night.active
+            if first_observation and not night.active:
+                return []      # starting in daylight is not worth an event
+            if night.active:
+                description = (
+                    f"Low-light conditions detected (scene luma "
+                    f"{night.luminance:.0f}/255"
+                    + (", monochrome/IR source" if night.monochrome else "")
+                    + f"); enhancement engaged at gain {night.gain:.1f}x"
+                )
+            else:
+                description = (
+                    f"Normal lighting restored (scene luma "
+                    f"{night.luminance:.0f}/255); enhancement disengaged"
+                )
+            return [self._make(EventType.LOW_LIGHT, Severity.INFO, description)]
 
     def _evaluate_lost(
         self, lost: Sequence[TrackedObject], events: List[SecurityEvent]

@@ -6,19 +6,19 @@ implementation otherwise, so the visual output is equivalent either way.
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 
 from sentinel.models import (
-    AppMode, AppSettings, LineConfig, TrackedObject, TrackPhase, ZoneConfig,
-    ZoneStatus,
+    AppMode, AppSettings, LineConfig, NightStatus, TrackedObject, TrackPhase,
+    ZoneConfig, ZoneStatus,
 )
 from sentinel.theme import Palette, hex_to_bgr
 from sentinel.vision.supervision_adapter import SupervisionAdapter
 
-__all__ = ["FrameRenderer"]
+__all__ = ["FrameRenderer", "ThermalOverlay"]
 
 
 class FrameRenderer:
@@ -176,6 +176,7 @@ class FrameRenderer:
         frame: "np.ndarray", *, fps: float, mode: AppMode, source: str,
         detector: str, people: int, vehicles: int, tracks: int,
         synthetic: bool, settings: AppSettings, critical: int,
+        night: Optional[NightStatus] = None,
     ) -> None:
         height, width = frame.shape[:2]
         pad = 10
@@ -190,6 +191,8 @@ class FrameRenderer:
                     0.45, (226, 234, 244), 1, cv2.LINE_AA)
 
         right_bits: List[str] = []
+        if night is not None and night.active:
+            right_bits.append("NIGHT")
         if settings.show_fps_overlay:
             right_bits.append(f"{fps:5.1f} FPS")
         right_bits.append(f"P {people}")
@@ -211,6 +214,19 @@ class FrameRenderer:
                           hex_to_bgr(Palette.VIOLET), -1)
             cv2.putText(frame, badge, (bx + 8, by + bh + 3),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (20, 14, 30), 2, cv2.LINE_AA)
+
+        # Low-light indicator: makes it unmistakable that the displayed image
+        # has been enhanced rather than captured this way.
+        if night is not None and night.active:
+            text = f"LOW LIGHT  gain {night.gain:.1f}x"
+            if night.monochrome:
+                text += "  IR"
+            (tw2, th2), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+            bx, by = pad, bar_h + 12
+            cv2.rectangle(frame, (bx, by), (bx + tw2 + 14, by + th2 + 10),
+                          hex_to_bgr(Palette.CYAN), -1)
+            cv2.putText(frame, text, (bx + 7, by + th2 + 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (10, 20, 24), 1, cv2.LINE_AA)
 
         # Critical-alert border pulse.
         if critical > 0:
@@ -238,3 +254,88 @@ class FrameRenderer:
             cv2.putText(frame, subtitle, ((width - sw) // 2, (height + th) // 2 + 24),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (130, 144, 160), 1, cv2.LINE_AA)
         return frame
+
+
+class ThermalOverlay:
+    """On-frame thermal chrome: mode banner, colour scale and hotspot boxes.
+
+    Mirrors the layout of a thermal-camera HUD.  Every reading it draws is
+    labelled with its true unit - intensity percent unless the source is a
+    declared radiometric thermal camera, in which case degrees Celsius.
+    """
+
+    SCALE_W = 16
+    SCALE_H = 150
+
+    @staticmethod
+    def draw(
+        frame: "np.ndarray", status, processor, settings: AppSettings
+    ) -> None:
+        if not status.active or not settings.thermal_overlay:
+            return
+        ThermalOverlay._draw_banner(frame, status)
+        ThermalOverlay._draw_scale(frame, status, processor)
+        ThermalOverlay._draw_hotspots(frame, status)
+
+    @staticmethod
+    def _draw_banner(frame: "np.ndarray", status) -> None:
+        label = f"THERMAL MODE - {status.palette.value.upper()}"
+        if not status.radiometric:
+            label += "  (FALSE COLOUR, NO TEMPERATURE)"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+        x, y = 10, 46
+        cv2.rectangle(frame, (x, y), (x + tw + 14, y + th + 10),
+                      hex_to_bgr(Palette.WARN), -1)
+        cv2.putText(frame, label, (x + 7, y + th + 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (20, 16, 8), 1, cv2.LINE_AA)
+
+    @staticmethod
+    def _draw_scale(frame: "np.ndarray", status, processor) -> None:
+        """Vertical colour ramp annotated with the range it represents."""
+        height, _width = frame.shape[:2]
+        x = 12
+        y = 86
+        if y + ThermalOverlay.SCALE_H + 20 > height:
+            return                      # too short a frame: skip the scale
+
+        ramp = np.linspace(255, 0, ThermalOverlay.SCALE_H).astype(np.uint8)
+        ramp = np.repeat(ramp[:, None], ThermalOverlay.SCALE_W, axis=1)
+        coloured = processor.colorize(ramp, status.palette)
+        frame[y:y + ThermalOverlay.SCALE_H, x:x + ThermalOverlay.SCALE_W] = coloured
+        cv2.rectangle(frame, (x - 1, y - 1),
+                      (x + ThermalOverlay.SCALE_W + 1, y + ThermalOverlay.SCALE_H + 1),
+                      (210, 220, 230), 1)
+
+        if status.radiometric and status.max_temp_c is not None:
+            top, bottom, unit = status.max_temp_c, status.min_temp_c or 0.0, "C"
+        else:
+            top, bottom, unit = 100.0, 0.0, "%"
+        for value, ty in ((top, y + 8), (bottom, y + ThermalOverlay.SCALE_H)):
+            text = f"{value:.0f}{unit}"
+            tx = x + ThermalOverlay.SCALE_W + 5
+            cv2.putText(frame, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.36, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(frame, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.36, (225, 233, 240), 1, cv2.LINE_AA)
+
+    @staticmethod
+    def _draw_hotspots(frame: "np.ndarray", status) -> None:
+        for spot in status.hotspots:
+            x1, y1, x2, y2 = spot.bbox
+            colour = hex_to_bgr(Palette.WARN)
+            # Corner brackets, the convention on thermal HUDs.
+            arm = max(8, int((x2 - x1) * 0.2))
+            for cx, cy, dx, dy in (
+                (x1, y1, 1, 1), (x2, y1, -1, 1), (x1, y2, 1, -1), (x2, y2, -1, -1)
+            ):
+                cv2.line(frame, (cx, cy), (cx + dx * arm, cy), colour, 2, cv2.LINE_AA)
+                cv2.line(frame, (cx, cy), (cx, cy + dy * arm), colour, 2, cv2.LINE_AA)
+
+            if spot.temperature_c is not None:
+                text = f"{spot.temperature_c:.1f}C"
+            else:
+                text = f"{spot.peak / 2.55:.0f}%"
+            cv2.putText(frame, text, (x1, max(12, y1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(frame, text, (x1, max(12, y1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.44, colour, 1, cv2.LINE_AA)

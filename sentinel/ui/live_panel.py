@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QBrush
 from PyQt6.QtWidgets import (
-    QGridLayout, QLabel, QListWidget, QListWidgetItem, QVBoxLayout, QWidget,
+    QGridLayout, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
+    QPushButton, QVBoxLayout, QWidget,
 )
 
-from sentinel.models import FrameResult, SecurityEvent, Severity, ZoneStatus
+from sentinel.models import (
+    FrameResult, LineConfig, SecurityEvent, Severity, ZoneStatus,
+)
 from sentinel.theme import Palette
 from sentinel.ui.event_table import EventTable
 from sentinel.ui.widgets import StatCard, card, qcolor
@@ -18,13 +22,26 @@ __all__ = ["LivePanel"]
 
 
 class LivePanel(QWidget):
-    """Live operational readout shown beside the video."""
+    """Live operational readout shown beside the video.
+
+    Zone and line rows are editable in place: double-click (or select and press
+    Edit) to open the corresponding editor, so an operator can retune a zone
+    without leaving the live view.
+    """
 
     #: Seconds after which the alert banner reverts to "no active alerts".
     ALERT_HOLD_S = 20.0
 
+    #: Qt item-data role carrying ("zone"|"line", id) for each status row.
+    ROW_REF = int(Qt.ItemDataRole.UserRole) + 1
+
+    editZoneRequested = pyqtSignal(str)   # zone_id
+    editLineRequested = pyqtSignal(str)   # line_id
+
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
+        self._lines: List[LineConfig] = []
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(11, 11, 11, 11)
         layout.setSpacing(11)
@@ -60,13 +77,31 @@ class LivePanel(QWidget):
         counts_layout.addLayout(grid)
         layout.addWidget(counts_frame)
 
-        # -- zone status -------------------------------------------------------
+        # -- zone status (editable) ---------------------------------------------
         zone_frame, zone_layout = card("Zone Status")
         self.list_zones = QListWidget()
         self.list_zones.setMinimumHeight(120)
         self.list_zones.setMaximumHeight(190)
+        self.list_zones.setToolTip(
+            "Double-click a zone or line to edit its settings"
+        )
+        self.list_zones.itemDoubleClicked.connect(self._on_row_activated)
         zone_layout.addWidget(self.list_zones)
+
+        zone_actions = QHBoxLayout()
+        zone_actions.setSpacing(6)
+        self.btn_edit_zone = QPushButton("Edit Selected")
+        self.btn_edit_zone.setObjectName("Ghost")
+        self.btn_edit_zone.clicked.connect(self._on_edit_clicked)
+        zone_actions.addWidget(self.btn_edit_zone)
+        zone_actions.addStretch(1)
+        hint = QLabel("double-click to edit")
+        hint.setStyleSheet(f"color: {Palette.TEXT_FAINT}; font-size: 9px;")
+        zone_actions.addWidget(hint)
+        zone_layout.addLayout(zone_actions)
         layout.addWidget(zone_frame)
+
+        layout.addWidget(self._build_thermal_card())
 
         # -- recent events ------------------------------------------------------
         events_frame, events_layout = card("Recent Events")
@@ -83,17 +118,82 @@ class LivePanel(QWidget):
         self.cards["flow"].set_value(
             f"{result.line_in} / {result.line_out}", "entries / exits"
         )
-        self.update_zones(result.zone_status)
+        self.update_zones(result.zone_status, result.line_counts)
+        self.update_thermal(result)
 
-    def update_zones(self, statuses: Sequence[ZoneStatus]) -> None:
-        if self.list_zones.count() != len(statuses):
-            self.list_zones.clear()
-            for _ in statuses:
-                self.list_zones.addItem(QListWidgetItem(""))
-        for index, status in enumerate(statuses):
-            item = self.list_zones.item(index)
-            if item is None:
-                continue
+    def _build_thermal_card(self) -> QWidget:
+        """Thermal readout row: max, average, hotspot share and scope note."""
+        frame, layout = card("Thermal Analytics")
+        grid = QGridLayout()
+        grid.setSpacing(8)
+        self.thermal_cards: Dict[str, StatCard] = {
+            "max": StatCard("Max", "-", "", Palette.CRIT),
+            "avg": StatCard("Average", "-", "", Palette.WARN),
+            "hotspots": StatCard("Hotspots", "0", "", Palette.MAGENTA),
+            "coverage": StatCard("Hot Area", "0%", "", Palette.CYAN),
+        }
+        for index, widget in enumerate(self.thermal_cards.values()):
+            grid.addWidget(widget, index // 2, index % 2)
+        layout.addLayout(grid)
+
+        self.label_thermal_note = QLabel("Thermal mode off")
+        self.label_thermal_note.setWordWrap(True)
+        self.label_thermal_note.setStyleSheet(
+            f"color: {Palette.TEXT_FAINT}; font-size: 9px;"
+        )
+        layout.addWidget(self.label_thermal_note)
+        self.thermal_frame = frame
+        return frame
+
+    def update_thermal(self, result: FrameResult) -> None:
+        """Render thermal readings, or an explicit n/a when none are valid."""
+        status = result.thermal
+        active = status is not None and getattr(status, "active", False)
+        self.thermal_frame.setVisible(active)
+        if not active:
+            return
+
+        self.thermal_cards["max"].set_value(status.format_max(), "peak")
+        self.thermal_cards["avg"].set_value(status.format_avg(), "scene")
+        self.thermal_cards["hotspots"].set_value(
+            len(status.hotspots), "regions"
+        )
+        self.thermal_cards["coverage"].set_value(
+            f"{status.hotspot_fraction * 100:.1f}%", "of frame"
+        )
+        if status.radiometric:
+            self.label_thermal_note.setText(
+                "Radiometric: values mapped from the calibrated range you set "
+                "for this thermal source."
+            )
+            self.label_thermal_note.setStyleSheet(
+                f"color: {Palette.OK}; font-size: 9px;"
+            )
+        else:
+            # This is the important one: no pretending a webcam measures heat.
+            self.label_thermal_note.setText(
+                "FALSE COLOUR - values are image intensity, NOT temperature. "
+                "Connect a calibrated thermal camera and switch to Radiometric "
+                "for real degrees."
+            )
+            self.label_thermal_note.setStyleSheet(
+                f"color: {Palette.WARN}; font-size: 9px;"
+            )
+
+    def set_lines(self, lines: Sequence[LineConfig]) -> None:
+        """Adopt the counting lines so they can be listed and edited."""
+        self._lines = list(lines)
+
+    def update_zones(
+        self, statuses: Sequence[ZoneStatus],
+        line_counts: Optional[Dict[str, Tuple[int, int]]] = None,
+    ) -> None:
+        """Rebuild the status rows for every zone, then every counting line."""
+        counts = line_counts or {}
+        rows: List[Tuple[str, str, str]] = []   # (ref_kind, ref_id, text)
+        colours: List[str] = []
+
+        for status in statuses:
             limit = f" / {status.max_occupancy}" if status.max_occupancy else ""
             flag = "  BREACH" if status.breached else ""
             state = "" if status.enabled else "  (disabled)"
@@ -101,12 +201,54 @@ class LivePanel(QWidget):
             # a vehicle-triggered breach is not displayed as "0 BREACH".
             extra = (f"  ({status.objects} obj)"
                      if status.objects != status.occupancy else "")
-            item.setText(
-                f"{status.name}:  {status.occupancy}{limit}{extra}{flag}{state}"
+            rows.append((
+                "zone", status.zone_id,
+                f"{status.name}:  {status.occupancy}{limit}{extra}{flag}{state}",
+            ))
+            colours.append(
+                Palette.CRIT if status.breached
+                else (status.color if status.enabled else Palette.TEXT_FAINT)
             )
-            colour = (Palette.CRIT if status.breached
-                      else (status.color if status.enabled else Palette.TEXT_FAINT))
+
+        for line in self._lines:
+            inbound, outbound = counts.get(line.line_id, (0, 0))
+            state = "" if line.enabled else "  (disabled)"
+            rows.append((
+                "line", line.line_id,
+                f"{line.name}:  in {inbound} / out {outbound}{state}",
+            ))
+            colours.append(line.color if line.enabled else Palette.TEXT_FAINT)
+
+        if self.list_zones.count() != len(rows):
+            self.list_zones.clear()
+            for _ in rows:
+                self.list_zones.addItem(QListWidgetItem(""))
+        for index, ((kind, ref_id, text), colour) in enumerate(zip(rows, colours)):
+            item = self.list_zones.item(index)
+            if item is None:
+                continue
+            item.setText(text)
             item.setForeground(QBrush(qcolor(colour)))
+            item.setData(self.ROW_REF, f"{kind}:{ref_id}")
+
+    # -- row editing ---------------------------------------------------------
+    def _on_row_activated(self, item: QListWidgetItem) -> None:
+        self._emit_edit(item)
+
+    def _on_edit_clicked(self) -> None:
+        self._emit_edit(self.list_zones.currentItem())
+
+    def _emit_edit(self, item: Optional[QListWidgetItem]) -> None:
+        if item is None:
+            return
+        ref = item.data(self.ROW_REF)
+        if not isinstance(ref, str) or ":" not in ref:
+            return
+        kind, ref_id = ref.split(":", 1)
+        if kind == "zone":
+            self.editZoneRequested.emit(ref_id)
+        elif kind == "line":
+            self.editLineRequested.emit(ref_id)
 
     def add_events(self, events: Sequence[SecurityEvent]) -> None:
         self.table_recent.add_events(events, limit=120)

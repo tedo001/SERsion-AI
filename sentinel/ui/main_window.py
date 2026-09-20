@@ -19,7 +19,7 @@ import cv2
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot
 from PyQt6.QtGui import QCursor
 from PyQt6.QtWidgets import (
-    QButtonGroup, QDockWidget, QFileDialog, QFrame, QHBoxLayout, QLabel,
+    QButtonGroup, QDialog, QDockWidget, QFileDialog, QFrame, QHBoxLayout, QLabel,
     QMainWindow, QMessageBox, QPushButton, QStackedWidget, QStatusBar,
     QVBoxLayout, QWidget,
 )
@@ -37,6 +37,7 @@ from sentinel.storage import EventDatabase
 from sentinel.storage.settings_store import SettingsManager
 from sentinel.theme import Palette
 from sentinel.ui.live_panel import LivePanel
+from sentinel.ui.zone_editor import LineEditorDialog, ZoneEditorDialog
 from sentinel.ui.pages import (
     AnalyticsPage, DashboardPage, EventsPage, LiveMonitorPage, ModelsPage,
     SettingsPage, SourcesPage, ZonesPage,
@@ -141,6 +142,8 @@ class MainWindow(QMainWindow):
             else f"SQLite unavailable ({self.database.error}) - events are not persisted"
         )
         self._build_right_dock()
+        # The panel owns the line rows, so seed it once the dock exists.
+        self.live_panel.set_lines(self.lines)
 
     def _build_top_bar(self) -> QFrame:
         bar = QFrame()
@@ -271,7 +274,7 @@ class MainWindow(QMainWindow):
         self.setStatusBar(bar)
         self.status_labels: Dict[str, QLabel] = {}
         fields = ("Source", "Resolution", "FPS", "Device", "Model",
-                  "Tracking", "Pipeline")
+                  "Tracking", "Light", "Pipeline")
         for index, field in enumerate(fields):
             label = QLabel(f"{field}: -")
             label.setStyleSheet(f"color: {Palette.TEXT_DIM}; font-size: 11px;")
@@ -327,6 +330,10 @@ class MainWindow(QMainWindow):
         zones.saveRequested.connect(self._on_zones_save)
         zones.resetRequested.connect(self._on_zones_reset)
         zones.statusMessage.connect(self._set_status)
+
+        # Editing straight from the live Zone Status panel.
+        self.live_panel.editZoneRequested.connect(self._edit_zone)
+        self.live_panel.editLineRequested.connect(self._edit_line)
 
         models = self.page_models
         models.loadRequested.connect(self._on_load_model)
@@ -408,6 +415,7 @@ class MainWindow(QMainWindow):
         self.controller.set_mode(mode)
         self.controller.configure_zones(self.zones, self.lines)
         self.page_zones.set_zones(self.zones)
+        self.live_panel.set_lines(self.lines)
         self.page_live.set_mode(mode)
         self.page_settings.set_mode(mode)
         self.page_dashboard.set_subtitle(
@@ -660,8 +668,23 @@ class MainWindow(QMainWindow):
         self.status_labels["Model"].setText(f"Model: {detector_label}")
         self.status_labels["Tracking"].setText(
             f"Tracking: {'on' if self.settings.tracking_enabled else 'off'}")
+        self.status_labels["Light"].setText(f"Light: {self._light_label()}")
         self.status_labels["Pipeline"].setText(
             f"Pipeline: {self.controller.state.value}")
+
+    def _light_label(self) -> str:
+        """Scene-light summary for the status bar."""
+        result = self.controller.latest_result()
+        if result is None:
+            return "-"
+        night = result.night
+        thermal = result.thermal
+        parts = [f"{night.label} ({night.luminance:.0f})"]
+        if thermal is not None and getattr(thermal, "active", False):
+            parts.append(
+                "thermal" if thermal.radiometric else "false-colour"
+            )
+        return "  ".join(parts)
 
     def _summary_text(self, snapshot, telemetry) -> str:
         info = self.controller.source_info
@@ -797,6 +820,40 @@ class MainWindow(QMainWindow):
     # ==================================================================
     def _on_zones_changed(self) -> None:
         self.controller.configure_zones(self.zones, self.lines)
+        self.live_panel.set_lines(self.lines)
+
+    @pyqtSlot(str)
+    def _edit_zone(self, zone_id: str) -> None:
+        """Open the zone editor for a row clicked in the live status panel."""
+        zone = next((z for z in self.zones if z.zone_id == zone_id), None)
+        if zone is None:
+            return
+        dialog = ZoneEditorDialog(zone, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            dialog.apply()
+            self.page_zones.refresh_table()
+            self._on_zones_changed()
+            SettingsManager.save_zones(self.settings.mode, self.zones, self.lines)
+            self._set_status(f"Zone '{zone.name}' updated")
+            self._log_system_event(
+                f"Zone '{zone.name}' reconfigured "
+                f"({zone.kind.value}, {zone.severity.value}, "
+                f"max occupancy {zone.max_occupancy or 'disabled'})"
+            )
+
+    @pyqtSlot(str)
+    def _edit_line(self, line_id: str) -> None:
+        """Open the counting-line editor for a row in the live status panel."""
+        line = next((l for l in self.lines if l.line_id == line_id), None)
+        if line is None:
+            return
+        dialog = LineEditorDialog(line, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            dialog.apply()
+            self._on_zones_changed()
+            SettingsManager.save_zones(self.settings.mode, self.zones, self.lines)
+            self._set_status(f"Line '{line.name}' updated")
+            self._log_system_event(f"Counting line '{line.name}' reconfigured")
 
     def _on_zones_save(self) -> None:
         SettingsManager.save_zones(self.settings.mode, self.zones, self.lines)
@@ -808,6 +865,7 @@ class MainWindow(QMainWindow):
         self.zones = default_zones(self.settings.mode)
         self.lines = default_lines(self.settings.mode)
         self.page_zones.set_zones(self.zones)
+        self.live_panel.set_lines(self.lines)
         self.controller.configure_zones(self.zones, self.lines)
         self._set_status("Default zones restored")
 

@@ -33,7 +33,8 @@ from sentinel.sources import BaseVideoSource, SourceError, SourceInfo
 from sentinel.storage import EventDatabase
 from sentinel.tracking import KalmanTracker
 from sentinel.vision import (
-    AnalyticsEngine, EventEngine, FrameRenderer, SupervisionAdapter,
+    AnalyticsEngine, EventEngine, FrameRenderer, NightVisionProcessor,
+    SupervisionAdapter, ThermalOverlay, ThermalProcessor,
 )
 
 __all__ = ["CaptureWorker", "InferenceWorker"]
@@ -238,6 +239,8 @@ class InferenceWorker(QThread):
         self._events = EventEngine(settings)
         self._adapter = SupervisionAdapter()
         self._renderer = FrameRenderer(self._adapter)
+        self._night = NightVisionProcessor(settings)
+        self._thermal = ThermalProcessor(settings)
         self._monitor = PerformanceMonitor()
 
         self._zones: List[ZoneConfig] = []
@@ -293,6 +296,8 @@ class InferenceWorker(QThread):
             self._settings = settings
             self._detector.update_settings(settings)
             self._events.update_settings(settings)
+            self._night.update_settings(settings)
+            self._thermal.update_settings(settings)
             self._tracker.configure(
                 settings.max_age, settings.min_hits, settings.iou_threshold
             )
@@ -387,6 +392,7 @@ class InferenceWorker(QThread):
                 self._reset_request = False
                 self._tracker.reset()
                 self._events.reset()
+                self._night.reset()
 
             packet = self._queue.get_latest(timeout=0.2)
             if packet is None:
@@ -420,6 +426,14 @@ class InferenceWorker(QThread):
         timings = Timings()
         height, width = frame.shape[:2]
 
+        # ---- Low-light analysis / enhancement -----------------------------
+        # Runs before detection so the model sees the enhanced frame.  In AUTO
+        # mode this costs almost nothing while the scene is bright.
+        t0 = time.perf_counter()
+        enhanced, night = self._night.process(frame)
+        detect_frame = enhanced if settings.night_enhance_detection else frame
+        timings.enhance_ms = (time.perf_counter() - t0) * 1000.0
+
         # ---- Detection ---------------------------------------------------
         t0 = time.perf_counter()
         detections: List[Detection] = []
@@ -439,7 +453,7 @@ class InferenceWorker(QThread):
             synthetic_used = True
         elif use_model:
             try:
-                detections = detector.predict(frame)
+                detections = detector.predict(detect_frame)
             except DetectorError as exc:
                 self._inference_failures += 1
                 if self._inference_failures in (1, 5, 25):
@@ -476,6 +490,7 @@ class InferenceWorker(QThread):
             )
         else:
             events, zone_status, alert_ids = [], [], set()
+        events.extend(self._events.note_light_conditions(night))
         timings.event_ms = (time.perf_counter() - t0) * 1000.0
 
         people = sum(1 for t in tracks if t.is_person)
@@ -484,7 +499,16 @@ class InferenceWorker(QThread):
 
         # ---- Annotation ---------------------------------------------------
         t0 = time.perf_counter()
-        canvas = frame.copy()   # never mutate the captured frame in place
+        # Show the enhanced image so the operator sees what the detector saw.
+        # The source frame is never mutated in place.
+        canvas = (enhanced if night.active else frame).copy()
+        # Thermal is a DISPLAY transform applied after detection: a palette-
+        # mapped frame is far outside a COCO-trained model's input distribution,
+        # so the detector above kept the real image.
+        canvas, thermal = self._thermal.process(canvas)
+        if night.active and settings.night_tint and not thermal.active:
+            # Cosmetic only, and applied after detection by construction.
+            canvas = self._night.apply_tint(canvas)
         if settings.show_zones and zones:
             status_map = {z.zone_id: z for z in zone_status}
             self._renderer.draw_zones(canvas, zones, status_map)
@@ -496,7 +520,9 @@ class InferenceWorker(QThread):
             people=people, vehicles=vehicles, tracks=len(tracks),
             synthetic=packet.synthetic, settings=settings,
             critical=sum(1 for e in events if e.severity is Severity.CRITICAL),
+            night=night,
         )
+        ThermalOverlay.draw(canvas, thermal, self._thermal, settings)
         timings.annotate_ms = (time.perf_counter() - t0) * 1000.0
         # Queue latency: wall-clock age of the frame minus the time this
         # thread spent on it.  packet.timestamp is time.time(), so the
@@ -547,6 +573,9 @@ class InferenceWorker(QThread):
             synthetic_detections=synthetic_used,
             line_in=total_in, line_out=total_out,
             occupancy=people,
+            line_counts=self._events.line_counts,
+            night=night,
+            thermal=thermal,
         )
 
     def shutdown(self) -> None:
