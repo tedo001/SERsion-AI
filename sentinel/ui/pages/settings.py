@@ -472,6 +472,12 @@ class SettingsPage(QWidget):
         self.slider_conf.blockSignals(False)
         self.label_conf.setText(f"{confidence:.2f}")
 
+    def set_night_mode(self, mode: NightMode) -> None:
+        """Mirror a night-vision change made from the Live Monitor toolbar."""
+        self.combo_night.blockSignals(True)
+        self.combo_night.setCurrentText(mode.value)
+        self.combo_night.blockSignals(False)
+
     def set_mode(self, mode: AppMode) -> None:
         self.combo_mode.blockSignals(True)
         self.combo_mode.setCurrentText(mode.value)

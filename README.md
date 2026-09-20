@@ -130,6 +130,12 @@ noise, and noise produces phantom detections). `Auto` engages only below a
 configurable luma threshold, with hysteresis so a borderline scene does not
 flap. Costs ~6 ms/frame when engaged and nothing measurable when it is not.
 
+Toggle it from the **Live Monitor** toolbar (or press **N**) — the button shows
+`NIGHT OFF` / `NIGHT AUTO` / `NIGHT ON`, with a dot when enhancement is actually
+running, which matters in Auto where the mode alone does not tell you. Right-click
+the button for the three-way choice; it stays in sync with the Settings page
+either way and takes effect on the next frame.
+
 > **What it is not:** image enhancement, not a thermal or infrared sensor. It
 > can only amplify light the camera actually captured — in total darkness there
 > is nothing to amplify. It adds no detection capability of its own; a model

@@ -309,6 +309,7 @@ class MainWindow(QMainWindow):
         live.confidenceChanged.connect(self._on_live_confidence)
         live.sourceKindChosen.connect(self._on_source_kind_chosen)
         live.modeChosen.connect(self._on_mode_chosen)
+        live.nightModeChanged.connect(self._on_night_mode_changed)
 
         sources = self.page_sources
         sources.simulationRequested.connect(self.controller.activate_simulation)
@@ -370,6 +371,7 @@ class MainWindow(QMainWindow):
         self.page_settings.apply_settings(self.settings)
         self.page_live.set_confidence(self.settings.confidence)
         self.page_live.set_mode(self.settings.mode)
+        self.page_live.set_night_mode(self.settings.night_mode)
         self.page_models.set_backend(self.settings.backend)
         self.page_dashboard.set_subtitle(
             f"{self.settings.mode.value} deployment  -  live edge analytics"
@@ -407,6 +409,19 @@ class MainWindow(QMainWindow):
         self.settings.confidence = confidence
         self.page_settings.set_confidence(confidence)
         self.controller.apply_settings(self.settings)
+
+    @pyqtSlot(object)
+    def _on_night_mode_changed(self, mode) -> None:
+        """Apply a night-vision change made from the Live Monitor toolbar.
+
+        Goes through the controller like any other setting, so it takes effect
+        on the very next frame without restarting the pipeline.
+        """
+        self.settings.night_mode = mode
+        self.controller.apply_settings(self.settings)
+        self.page_settings.set_night_mode(mode)
+        self.settings_manager.save_settings(self.settings)
+        self._set_status(f"Night vision: {mode.value}")
 
     def switch_mode(self, mode: AppMode) -> None:
         """Swap scenario: reload the zone layout and re-seed the simulation."""
@@ -593,6 +608,7 @@ class MainWindow(QMainWindow):
             self.page_zones.show_frame(result.frame)
 
         self.live_panel.update_counts(result)
+        self.page_live.set_night_active(result.night.active)
 
     def _slow_tick(self) -> None:
         """One-second cadence: clock, dashboard, telemetry, status bar."""

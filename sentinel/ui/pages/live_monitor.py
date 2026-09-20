@@ -7,12 +7,13 @@ from typing import Optional
 import numpy as np
 
 from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
-    QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton, QSlider, QVBoxLayout,
-    QWidget,
+    QComboBox, QFrame, QHBoxLayout, QLabel, QMenu, QPushButton, QSlider,
+    QVBoxLayout, QWidget,
 )
 
-from sentinel.models import AppMode, AppSettings, SourceKind
+from sentinel.models import AppMode, AppSettings, NightMode, SourceKind
 from sentinel.theme import Palette
 from sentinel.ui.video_view import VideoView
 from sentinel.ui.widgets import divider
@@ -30,6 +31,7 @@ class LiveMonitorPage(QWidget):
     restartRequested = pyqtSignal()
     seekRequested = pyqtSignal(int)
     confidenceChanged = pyqtSignal(float)
+    nightModeChanged = pyqtSignal(object)    # NightMode
 
     def __init__(self, settings: AppSettings, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -54,10 +56,29 @@ class LiveMonitorPage(QWidget):
             header.addWidget(caption)
             header.addWidget(widget)
 
+        # Night-vision toggle, right where the operator is already looking.
+        self.btn_night = QPushButton("NIGHT OFF")
+        self.btn_night.setCheckable(True)
+        self.btn_night.setMinimumWidth(116)
+        self.btn_night.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_night.setShortcut("N")
+        self.btn_night.setToolTip(
+            "Toggle low-light enhancement (shortcut: N).\n"
+            "Right-click for Off / Auto / On."
+        )
+        self.btn_night.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        header.addWidget(self.btn_night)
+
         self.btn_snapshot = QPushButton("Snapshot")
         self.btn_snapshot.setObjectName("Ghost")
         header.addWidget(self.btn_snapshot)
         layout.addLayout(header)
+
+        self._night_mode = settings.night_mode
+        self._night_live = False
+        self._restyle_night()
 
         # -- video surface ----------------------------------------------------
         self.video_view = VideoView()
@@ -132,6 +153,8 @@ class LiveMonitorPage(QWidget):
         self.slider_conf.valueChanged.connect(self._on_confidence)
         self.combo_source.currentTextChanged.connect(self._on_source_text)
         self.combo_mode.currentTextChanged.connect(self._on_mode_text)
+        self.btn_night.clicked.connect(self._on_night_clicked)
+        self.btn_night.customContextMenuRequested.connect(self._night_menu)
 
     # -- internal signal adapters -------------------------------------------
     def _on_confidence(self, value: int) -> None:
@@ -149,6 +172,87 @@ class LiveMonitorPage(QWidget):
             self.modeChosen.emit(AppMode(text))
         except ValueError:
             pass
+
+    # -- night vision --------------------------------------------------------
+    def _on_night_clicked(self) -> None:
+        """Plain on/off toggle.
+
+        AUTO counts as "on" for the first click, so pressing the button while
+        AUTO is armed turns enhancement off rather than forcing it on - which is
+        what someone reaching for an off switch expects.
+        """
+        if self._night_mode is NightMode.OFF:
+            self.set_night_mode(NightMode.ON)
+        else:
+            self.set_night_mode(NightMode.OFF)
+        self.nightModeChanged.emit(self._night_mode)
+
+    def _night_menu(self, position) -> None:
+        """Right-click menu - the only place AUTO is reachable from the toolbar."""
+        menu = QMenu(self)
+        for mode in NightMode:
+            action = QAction(f"Night vision: {mode.value}", menu)
+            action.setCheckable(True)
+            action.setChecked(mode is self._night_mode)
+            action.triggered.connect(
+                lambda _checked=False, m=mode: self._choose_night(m)
+            )
+            menu.addAction(action)
+        menu.exec(self.btn_night.mapToGlobal(position))
+
+    def _choose_night(self, mode: NightMode) -> None:
+        self.set_night_mode(mode)
+        self.nightModeChanged.emit(mode)
+
+    def set_night_mode(self, mode: NightMode) -> None:
+        """Reflect the stored mode without emitting (used to sync from Settings)."""
+        self._night_mode = mode
+        self._restyle_night()
+
+    def set_night_active(self, active: bool) -> None:
+        """Show whether enhancement is actually running right now.
+
+        In AUTO the mode alone does not say whether the scene is dark enough, so
+        the button reports the live state rather than just the setting.
+        """
+        if active == self._night_live:
+            return
+        self._night_live = active
+        self._restyle_night()
+
+    def _restyle_night(self) -> None:
+        mode = self._night_mode
+        dot = "  \u25cf"
+        if mode is NightMode.OFF:
+            text, colour, checked = "NIGHT OFF", Palette.TEXT_DIM, False
+        elif mode is NightMode.ON:
+            checked, colour = True, Palette.CYAN
+            text = "NIGHT ON" + (dot if self._night_live else "")
+        else:
+            checked = True
+            colour = Palette.CYAN if self._night_live else Palette.TEXT_DIM
+            text = "NIGHT AUTO" + (dot if self._night_live else "")
+
+        self.btn_night.blockSignals(True)
+        self.btn_night.setChecked(checked)
+        self.btn_night.blockSignals(False)
+        self.btn_night.setText(text)
+
+        if checked and self._night_live:
+            self.btn_night.setStyleSheet(
+                f"QPushButton {{ background-color: {colour}; color: #04101C;"
+                f" border: 1px solid {colour}; border-radius: 6px;"
+                f" padding: 7px 12px; font-weight: 700; font-size: 11px; }}"
+            )
+        else:
+            self.btn_night.setStyleSheet(
+                f"QPushButton {{ background-color: transparent;"
+                f" color: {colour}; border: 1px solid {Palette.BORDER_STRONG};"
+                f" border-radius: 6px; padding: 7px 12px; font-weight: 700;"
+                f" font-size: 11px; }}"
+                f"QPushButton:hover {{ border-color: {Palette.CYAN};"
+                f" color: {Palette.TEXT}; }}"
+            )
 
     # -- view updates (called by MainWindow) ---------------------------------
     def show_frame(self, frame: "np.ndarray") -> None:
